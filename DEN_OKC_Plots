@@ -1,0 +1,184 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Config
+SEASON = 2024                     
+OUTDIR = Path(".")
+
+# Combine and filter to requested season
+schedules = pd.concat([schedule, draft_schedule], ignore_index=True)
+schedules = schedules[schedules["season"] == SEASON].copy()
+
+# Basic cleaning
+for col in ["team", "opponent"]:
+    schedules[col] = schedules[col].astype(str).str.strip()
+
+#Haversine Distance (in km)
+def haversine(lat1, lon1, lat2, lon2):
+    """Vectorized great-circle distance in kilometers."""
+    R = 6371.0
+    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    return 2.0 * R * np.arcsin(np.sqrt(a))
+
+# Venue coordinates
+# Map team -> (lat, lon)
+loc = locations.set_index("team")[["latitude", "longitude"]]
+
+# Attach both team and opponent coordinates
+s2 = schedules.merge(loc, left_on="team", right_index=True, how="left")
+s2 = s2.merge(loc, left_on="opponent", right_index=True, how="left", suffixes=("_team", "_opp"))
+
+# Venue of current game (from 'team' perspective)
+# home == 1 -> team's home arena; home == 0 -> opponent's arena
+s2["venue_lat"] = np.where(s2["home"] == 1, s2["latitude_team"], s2["latitude_opp"])
+s2["venue_lon"] = np.where(s2["home"] == 1, s2["longitude_team"], s2["longitude_opp"])
+
+# Schedule factors
+def prepare_team_schedule(df: pd.DataFrame, team: str) -> pd.DataFrame:
+    """Compute days since last game, sequential travel, density, and labels for one team."""
+    t = df[df["team"] == team].sort_values("gamedate").copy()
+
+    # Days since last game = 1 (Back-to-Backs):
+    t["prev_date"] = t["gamedate"].shift(1)
+    t["days_since_last"] = (t["gamedate"] - t["prev_date"]).dt.days
+    t["is_b2b"] = t["days_since_last"] == 1
+
+    # Sequential travel distance (km):
+    t["prev_venue_lat"] = t["venue_lat"].shift(1)
+    t["prev_venue_lon"] = t["venue_lon"].shift(1)
+    t["seq_travel_km"] = haversine(t["prev_venue_lat"], t["prev_venue_lon"],
+                                   t["venue_lat"], t["venue_lon"])
+    # First game has no prior venue
+    t.loc[t.index.min(), "seq_travel_km"] = np.nan
+    t["cum_travel_km"] = t["seq_travel_km"].fillna(0).cumsum()
+
+    # Rolling density: games in last 7/14 days
+    t = t.set_index("gamedate")
+    t["game_flag"] = 1
+    t["games_last_7d"] = t["game_flag"].rolling("7D").sum()
+    t["games_last_14d"] = t["game_flag"].rolling("14D").sum()
+
+    # Density bursts (4-in-6, 5-in-7):
+    t["games_last_6d"] = t["game_flag"].rolling("6D").sum()
+    t["is_4in6"] = t["games_last_6d"] >= 4
+    t["is_5in7"] = t["games_last_7d"] >= 5
+
+    t = t.reset_index()
+    t["vs"] = np.where(t["home"] == 1, "vs", "@")
+    t["opponent_label"] = t["vs"] + " " + t["opponent"]
+    return t
+
+def make_team_fig(t: pd.DataFrame, team: str):
+    """Two-row interactive figure:
+       Row1: game dots (size=travel, color=home/away, diamond outline if B2B)
+       Row2: games in last 7 days (density) + cumulative travel (km)"""
+    # Marker sizes from travel (clip extreme outliers)
+    size_km = t["seq_travel_km"].fillna(0).clip(0, 3500)
+    smin, smax = 6, 26
+    if size_km.max() > 0:
+        msize = smin + (size_km / size_km.max()) * (smax - smin)
+    else:
+        msize = np.full(len(size_km), smin)
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+        specs=[[{"type": "xy"}], [{"secondary_y": True}]]
+    )
+
+    # Color map: Home (1) blue, Away (0) orange
+    color_map = {1: "#1f77b4", 0: "#ff7f0e"}
+    colors = t["home"].map(color_map)
+    symbols = np.where(t["is_b2b"], "diamond", "circle")
+
+    # Rich hovertext
+    hovertext = (
+        "Date: " + t["gamedate"].dt.strftime("%Y-%m-%d") +
+        "<br>" + t["opponent_label"] +
+        "<br>Days Since Last: " + t["days_since_last"].astype("Int64").astype(str) +
+        "<br>Seq Travel: " + t["seq_travel_km"].round(0).astype("Int64").astype(str) + " km" +
+        "<br>Games last 7d: " + t["games_last_7d"].astype(int).astype(str) +
+        "<br>Cumulative travel: " + t["cum_travel_km"].round(0).astype(int).astype(str) + " km"
+    )
+
+    # Row 1: timeline of games
+    fig.add_trace(
+        go.Scatter(
+            x=t["gamedate"], y=[1]*len(t), mode="markers",
+            marker=dict(size=msize, color=colors, line=dict(width=0.8, color="rgba(50,50,50,0.5)")),
+            marker_symbol=symbols,
+            hovertemplate="%{text}<extra></extra>",
+            text=hovertext,
+            name="Games (size=travel)",
+        ),
+        row=1, col=1
+    )
+    # B2B outline overlay
+    fig.add_trace(
+        go.Scatter(
+            x=t.loc[t["is_b2b"], "gamedate"],
+            y=[1]*t["is_b2b"].sum(),
+            mode="markers",
+            marker=dict(size=(msize[t["is_b2b"]] + 5),
+                        color="rgba(0,0,0,0)",
+                        line=dict(width=2.0, color="crimson")),
+            marker_symbol="diamond",
+            hoverinfo="skip",
+            showlegend=False,
+        ),
+        row=1, col=1
+    )
+
+    # Row 2: density and cumulative travel
+    fig.add_trace(
+        go.Scatter(
+            x=t["gamedate"], y=t["games_last_7d"],
+            mode="lines+markers",
+            name="Games in last 7 days",
+        ),
+        row=2, col=1, secondary_y=False
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=t["gamedate"], y=t["cum_travel_km"],
+            mode="lines",
+            name="Cumulative travel (km)",
+        ),
+        row=2, col=1, secondary_y=True
+    )
+
+    # Axes/labels/layout
+    fig.update_yaxes(visible=False, row=1, col=1)
+    fig.update_yaxes(title_text="Games / 7d", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Cumulative Travel (km)", row=2, col=1, secondary_y=True)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
+
+    fig.update_layout(
+        title=f"{team} — {SEASON}–{SEASON+1} Schedule Overview "
+              f"(size = sequential travel, diamonds = days since last game = 1)",
+        height=720,
+        legend_orientation="h",
+        legend_y=1.08,
+        margin=dict(l=40, r=40, t=80, b=40),
+        hovermode="x unified"
+    )
+    fig.add_annotation(
+        text="<b>Color</b>: Blue = Home, Orange = Away &nbsp;&nbsp; "
+             "<b>Marker</b>: Diamond outline = Days Since Last Game = 1 (B2B)",
+        showarrow=False, xref="paper", yref="paper", x=0, y=1.12, font=dict(size=12)
+    )
+    return fig
+
+#Build and Save Html
+for team in ["OKC", "DEN"]:
+    team_df = prepare_team_schedule(s2, team)
+    fig = make_team_fig(team_df, team)
+    out_path = OUTDIR / f"{team}_schedule_{SEASON}_{SEASON+1}.html"
+    fig.write_html(out_path)
+    print(f"Saved: {out_path.resolve()}")
